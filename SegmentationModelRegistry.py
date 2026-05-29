@@ -1,5 +1,7 @@
 import inspect
+import io
 import logging
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,14 +15,34 @@ from torchvision.models.segmentation import (
 )
 
 
+class _NullConsole(io.TextIOBase):
+    """Fallback stream for GUI/pythonw environments where stdio can be None."""
+
+    def writable(self):
+        return True
+
+    def write(self, text):
+        return len(text)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+
+def _ensure_console_streams():
+    if sys.stdout is None:
+        sys.stdout = _NullConsole()
+    if sys.stderr is None:
+        sys.stderr = _NullConsole()
+
+
 ARCH_TO_BACKBONES = {
     "DeepLabV3": ["ResNet50", "ResNet101", "MobileNetV3-Large"],
     "DeepLabV3+": ["ResNet50", "ResNet101", "MobileNetV3-Large"],
     "FCN": ["ResNet50", "ResNet101"],
     "PSPNet": ["ResNet50"],
-    "SegFormer": ["B2"],
-    "Mask2Former": ["Swin-T"],
-    "SegNeXt": ["Tiny", "Small"],
     "UPerNet-Swin": ["Tiny"],
     "U-Net": [],
     "SFA-Net": [],
@@ -42,9 +64,6 @@ ARCH_PARAM_SCHEMAS = {
         {"key": "aux_loss", "label": "辅助损失", "type": "bool", "default": False},
     ],
     "PSPNet": [],
-    "SegFormer": [],
-    "Mask2Former": [],
-    "SegNeXt": [],
     "UPerNet-Swin": [],
     "U-Net": [
         {"key": "base_channels", "label": "基础通道数", "type": "int", "default": 64},
@@ -64,10 +83,6 @@ MODEL_BUILDERS = {
     "FCN (ResNet50)": (fcn_resnet50, "fcn", 512),
     "FCN (ResNet101)": (fcn_resnet101, "fcn", 512),
     "PSPNet (ResNet50)": (None, "pspnet", 2048),
-    "SegFormer (B2)": (None, "segformer", 768),
-    "Mask2Former (Swin-T)": (None, "mask2former", 256),
-    "SegNeXt (Tiny)": (None, "segnext", 256),
-    "SegNeXt (Small)": (None, "segnext", 384),
     "UPerNet-Swin (Tiny)": (None, "upernet_swin", 512),
     "U-Net": (None, "unet", 64),
     "SFA-Net": (None, "sfanet", 64),
@@ -298,9 +313,9 @@ class ResNetBackbone(nn.Module):
         weights = _resolve_backbone_weights(backbone_name, use_pretrained)
         dilation_cfg = [False, True, True] if output_stride == 8 else [False, False, True]
         if backbone_name == "ResNet50":
-            model = resnet50(weights=weights, replace_stride_with_dilation=dilation_cfg)
+            model = resnet50(weights=weights, progress=False, replace_stride_with_dilation=dilation_cfg)
         elif backbone_name == "ResNet101":
-            model = resnet101(weights=weights, replace_stride_with_dilation=dilation_cfg)
+            model = resnet101(weights=weights, progress=False, replace_stride_with_dilation=dilation_cfg)
         else:
             raise ValueError(f"不支持的ResNet骨干: {backbone_name}")
         self.stem = nn.Sequential(model.conv1, model.bn1, model.relu, model.maxpool)
@@ -319,7 +334,10 @@ class ResNetBackbone(nn.Module):
 class MobileNetV3Backbone(nn.Module):
     def __init__(self, use_pretrained):
         super().__init__()
-        features = mobilenet_v3_large(weights=_resolve_backbone_weights("MobileNetV3-Large", use_pretrained)).features
+        features = mobilenet_v3_large(
+            weights=_resolve_backbone_weights("MobileNetV3-Large", use_pretrained),
+            progress=False,
+        ).features
         stage_indices = [0] + [i for i, b in enumerate(features) if getattr(b, "_is_cn", False)] + [len(features) - 1]
         low_idx = stage_indices[-4]
         self.low_features = features[: low_idx + 1]
@@ -383,21 +401,6 @@ class TensorOutputWrapper(nn.Module):
         return {"out": logits}
 
 
-class Mask2FormerSemanticWrapper(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, x):
-        outputs = self.model(pixel_values=x)
-        class_logits = outputs.class_queries_logits.softmax(dim=-1)[..., :-1]
-        mask_logits = outputs.masks_queries_logits.sigmoid()
-        logits = torch.einsum("bqc,bqhw->bchw", class_logits, mask_logits)
-        if logits.shape[-2:] != x.shape[-2:]:
-            logits = F.interpolate(logits, size=x.shape[-2:], mode="bilinear", align_corners=False)
-        return {"out": logits}
-
-
 def _missing_dependency_error(model_name, package_name, install_command):
     raise ImportError(
         f"{model_name} 需要安装 {package_name}。请先执行: {install_command}"
@@ -416,49 +419,6 @@ def build_pspnet_resnet50(num_classes, use_pretrained):
         classes=num_classes,
     )
     return TensorOutputWrapper(model)
-
-
-def build_segformer_b2(num_classes, use_pretrained):
-    try:
-        from transformers import SegformerConfig, SegformerForSemanticSegmentation
-    except ImportError:
-        _missing_dependency_error("SegFormer-B2", "transformers", "pip install transformers")
-
-    if use_pretrained:
-        model = SegformerForSemanticSegmentation.from_pretrained(
-            "nvidia/segformer-b2-finetuned-ade-512-512",
-            num_labels=num_classes,
-            ignore_mismatched_sizes=True,
-        )
-    else:
-        config = SegformerConfig(
-            num_labels=num_classes,
-            depths=[3, 4, 6, 3],
-            hidden_sizes=[64, 128, 320, 512],
-            decoder_hidden_size=768,
-            num_attention_heads=[1, 2, 5, 8],
-            sr_ratios=[8, 4, 2, 1],
-        )
-        model = SegformerForSemanticSegmentation(config)
-    return TensorOutputWrapper(model)
-
-
-def build_mask2former_swin_t(num_classes, use_pretrained):
-    try:
-        from transformers import Mask2FormerConfig, Mask2FormerForUniversalSegmentation
-    except ImportError:
-        _missing_dependency_error("Mask2Former-Swin-T", "transformers", "pip install transformers")
-
-    if use_pretrained:
-        model = Mask2FormerForUniversalSegmentation.from_pretrained(
-            "facebook/mask2former-swin-tiny-ade-semantic",
-            num_labels=num_classes,
-            ignore_mismatched_sizes=True,
-        )
-    else:
-        config = Mask2FormerConfig(num_labels=num_classes)
-        model = Mask2FormerForUniversalSegmentation(config)
-    return Mask2FormerSemanticWrapper(model)
 
 
 class ConvBNAct(nn.Sequential):
@@ -497,65 +457,6 @@ class MSCABlock(nn.Module):
         attn = base + self.branch11(self.branch7(base)) + self.branch31(self.branch21(base))
         x = self.proj2(self.attn(attn) * x)
         return residual + self.drop(x)
-
-
-class SegNeXtModel(nn.Module):
-    def __init__(self, num_classes=2, variant="Tiny"):
-        super().__init__()
-        if variant == "Small":
-            channels = [64, 128, 320, 512]
-            depths = [2, 2, 4, 2]
-            decoder_channels = 384
-        else:
-            channels = [32, 64, 160, 256]
-            depths = [2, 2, 3, 2]
-            decoder_channels = 256
-
-        self.variant = variant
-        self.stem = nn.Sequential(
-            ConvBNAct(3, channels[0] // 2, 3, stride=2),
-            ConvBNAct(channels[0] // 2, channels[0], 3, stride=2),
-        )
-        self.downsamples = nn.ModuleList([
-            ConvBNAct(channels[i], channels[i + 1], 3, stride=2) for i in range(3)
-        ])
-        self.stages = nn.ModuleList([
-            nn.Sequential(*[MSCABlock(channels[i]) for _ in range(depths[i])])
-            for i in range(4)
-        ])
-        self.lateral_convs = nn.ModuleList([
-            nn.Conv2d(ch, decoder_channels, 1) for ch in channels
-        ])
-        self.fuse = nn.Sequential(
-            ConvBNAct(decoder_channels * 4, decoder_channels, 3),
-            nn.Dropout2d(0.1),
-            nn.Conv2d(decoder_channels, num_classes, 1),
-        )
-        self.classifier = self.fuse
-
-    def forward(self, x):
-        input_size = x.shape[-2:]
-        features = []
-        x = self.stem(x)
-        x = self.stages[0](x)
-        features.append(x)
-        for downsample, stage in zip(self.downsamples, self.stages[1:]):
-            x = stage(downsample(x))
-            features.append(x)
-
-        target_size = features[0].shape[-2:]
-        fused = []
-        for feature, lateral in zip(features, self.lateral_convs):
-            feature = lateral(feature)
-            if feature.shape[-2:] != target_size:
-                feature = F.interpolate(feature, size=target_size, mode="bilinear", align_corners=False)
-            fused.append(feature)
-        logits = self.fuse(torch.cat(fused, dim=1))
-        return {"out": F.interpolate(logits, size=input_size, mode="bilinear", align_corners=False)}
-
-
-def build_segnext(num_classes, variant):
-    return SegNeXtModel(num_classes=num_classes, variant=variant)
 
 
 def build_upernet_swin_t(num_classes, use_pretrained):
@@ -658,6 +559,8 @@ class SFANet(nn.Module):
 
 
 def build_model(model_name, num_classes, use_pretrained=True, aux_loss=False, architecture_params=None):
+    _ensure_console_streams()
+
     if model_name not in MODEL_BUILDERS:
         raise ValueError(f"不支持的模型类型: {model_name}")
 
@@ -678,17 +581,13 @@ def build_model(model_name, num_classes, use_pretrained=True, aux_loss=False, ar
         ), family, cls_in_channels
     if family == "pspnet":
         return build_pspnet_resnet50(num_classes, use_pretrained), family, cls_in_channels
-    if family == "segformer":
-        return build_segformer_b2(num_classes, use_pretrained), family, cls_in_channels
-    if family == "mask2former":
-        return build_mask2former_swin_t(num_classes, use_pretrained), family, cls_in_channels
-    if family == "segnext":
-        return build_segnext(num_classes, backbone_name or "Tiny"), family, cls_in_channels
     if family == "upernet_swin":
         return build_upernet_swin_t(num_classes, use_pretrained), family, cls_in_channels
 
     weights = _resolve_seg_weights(model_name, use_pretrained)
     kwargs = {"weights": weights}
+    if "progress" in inspect.signature(builder_fn).parameters:
+        kwargs["progress"] = False
     requested_aux_loss = arch_params.get("aux_loss", aux_loss)
     if "aux_loss" in inspect.signature(builder_fn).parameters:
         # torchvision segmentation builders require aux_loss=True when pretrained segmentation weights are used.

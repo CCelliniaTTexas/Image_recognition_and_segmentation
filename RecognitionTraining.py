@@ -4,6 +4,8 @@ import tkinter as tk
 import torch.nn as nn
 import ttkbootstrap as ttk
 import threading
+import sys
+import time
 import logging.handlers
 import matplotlib.pyplot as plt
 import logging
@@ -14,6 +16,7 @@ from tkinter import filedialog, messagebox, StringVar
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from torchvision import models, transforms, datasets
 from torch.utils.data import DataLoader
+from SegmentationModelRegistry import _allow_torchvision_weights, _build_with_pretrained_fallback
 
 
 
@@ -22,6 +25,10 @@ class TrainingTab(ttk.Frame):
         super().__init__(parent)
         self.stop_event = threading.Event()
         self.processor = None
+        self._last_progress_update_time = 0.0
+        self._last_plot_refresh_time = 0.0
+        self._progress_update_interval = 0.5
+        self._plot_refresh_interval = 2.0
         # 修改数据存储结构，分别存储训练集和验证集的数据
         self.train_data = {
             'batch_indices': [],
@@ -202,7 +209,7 @@ class TrainingTab(ttk.Frame):
             ax.spines['right'].set_color(grid_color)
 
         self.figure.tight_layout(pad=2.0)
-        self.canvas.draw()
+        self.canvas.draw_idle()
 
     def on_theme_changed(self, event=None):
         """主题变化时更新图表"""
@@ -220,6 +227,10 @@ class TrainingTab(ttk.Frame):
 
         def _update():
             try:
+                now = time.perf_counter()
+                is_validation_update = val_loss is not None and val_acc is not None
+                should_redraw = is_validation_update or (now - self._last_plot_refresh_time >= self._plot_refresh_interval)
+
                 # 获取当前主题
                 current_theme = self.winfo_toplevel().style.theme_use()
                 is_dark_theme = current_theme == 'darkly'
@@ -261,7 +272,9 @@ class TrainingTab(ttk.Frame):
                     ax.tick_params(colors=text_color)
 
                 # 重绘图表
-                self.canvas.draw()
+                if should_redraw:
+                    self.canvas.draw_idle()
+                    self._last_plot_refresh_time = now
 
             except Exception as e:
                 logging.error(f"更新图表失败: {str(e)}")
@@ -340,6 +353,8 @@ class TrainingTab(ttk.Frame):
             # 记录训练开始
             logging.info(f"开始训练 - 数据集: {dataset_path}")
             logging.info(f"训练参数 - 类别数: {num_classes}, 批次大小: {batch_size}, 学习率: {learning_rate}")
+            self._last_progress_update_time = 0.0
+            self._last_plot_refresh_time = 0.0
 
             def update_progress(epoch, batch, total_batches, loss, accuracy):
                 if hasattr(self, 'progress_window') and self.progress_window.winfo_exists():
@@ -359,6 +374,7 @@ class TrainingTab(ttk.Frame):
                 target=self.train_model,
                 args=(dataset_path, save_path, num_classes, batch_size, learning_rate, epochs, update_progress)
             )
+            self.training_thread.daemon = True
             self.training_thread.start()
 
             # 绑定窗口关闭事件
@@ -376,7 +392,13 @@ class TrainingTab(ttk.Frame):
         device = torch.device("cuda:0" if config.get('use_gpu') and torch.cuda.is_available() else "cpu")
         try:
             # 初始化模型
-            model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)  # 使用预训练权重
+            weights = _allow_torchvision_weights(models.ResNet18_Weights.DEFAULT, "ResNet18")
+            model = _build_with_pretrained_fallback(
+                models.resnet18,
+                "ResNet18",
+                weights=weights,
+                progress=False,
+            )
 
             # 修改最后一层
             num_ftrs = model.fc.in_features
@@ -440,7 +462,13 @@ class TrainingTab(ttk.Frame):
             logging.info(f"类别映射: {train_dataset.class_to_idx}")
 
             # 创建数据加载器
-            num_workers = config.get('num_workers', max(1, multiprocessing.cpu_count() - 1))
+            configured_workers = int(config.get('num_workers', 0))
+            if sys.platform.startswith('win'):
+                # Tkinter + Windows multiprocessing DataLoader can make the GUI appear frozen.
+                num_workers = 0
+            else:
+                num_workers = max(0, configured_workers)
+            logging.info(f"DataLoader工作进程数: {num_workers}")
             train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True)
             val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=True)
 
@@ -496,10 +524,16 @@ class TrainingTab(ttk.Frame):
             best_val_acc = 0.0
             patience = 0
             max_patience = 10
+            last_ui_emit_time = 0.0
 
             def update_progress_and_plots(epoch, batch_idx, total_batches, avg_loss, accuracy):
+                nonlocal last_ui_emit_time
                 if self.stop_training:
                     return
+                now = time.perf_counter()
+                if batch_idx < total_batches and now - last_ui_emit_time < self._progress_update_interval:
+                    return
+                last_ui_emit_time = now
                 self.after(0, lambda: progress_callback(epoch, batch_idx, total_batches, avg_loss, accuracy))
                 current_batch = (epoch - 1) * len(train_loader) + batch_idx
                 self.after(0, lambda: self.update_plots(current_batch, avg_loss, accuracy))

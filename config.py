@@ -12,13 +12,15 @@ class Config:
         self.default_config = {
             'theme': 'cosmo',
             'use_gpu': torch.cuda.is_available(),
-            'num_workers': max(1, multiprocessing.cpu_count() - 1),
+            'num_workers': 0,
             'cpu_limit': 50,
             'gpu_memory_fraction': 0.8,
             'amp_enabled': True,
             'gradient_accumulation_steps': 1,
             'grad_clip_norm': 1.0,
             'loss_smoothing_alpha': 0.12,
+            'offline_mode': True,
+            'use_cached_pretrained': True,
             'auto_save_training_curves': True,
             'recent_files': {'models': [], 'class_files': [], 'folders': []}
         }
@@ -35,8 +37,16 @@ class Config:
             try:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     self.config = json.load(f)
+                changed = False
+                for key, value in self.default_config.items():
+                    if key not in self.config:
+                        self.config[key] = value
+                        changed = True
+                if changed:
+                    self.save_config()
             except Exception:
-                self.config = {}
+                self.config = self.default_config.copy()
+                self.save_config()
 
     def save_config(self):
         """保存配置"""

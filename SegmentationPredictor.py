@@ -326,7 +326,8 @@ class SegmentationPredictor:
                     output = F.interpolate(output, size=(orig_h, orig_w),
                                            mode='bilinear', align_corners=False)
                     pred = output.argmax(1).squeeze().cpu().numpy().astype(np.uint8)
-                    predicted_classes.update(np.unique(pred).astype(int).tolist())
+                    image_classes = sorted(np.unique(pred).astype(int).tolist())
+                    predicted_classes.update(image_classes)
 
                     mask_img = Image.fromarray(pred)
                     name, _ = os.path.splitext(filename)
@@ -336,8 +337,10 @@ class SegmentationPredictor:
                     self._colorize_mask(pred, color_map).save(color_path)
                     predictions.append({
                         "filename": filename,
+                        "image_path": img_path,
                         "mask_path": mask_path,
                         "color_path": color_path,
+                        "classes": image_classes,
                     })
 
                     if has_label:
@@ -618,28 +621,75 @@ class SegmentationPredictTab(ttk.Frame):
         color_map = dict(prediction_result.get("color_map", {}))
         preview_window = tk.Toplevel(self)
         preview_window.title("分割预览与标签颜色设置")
-        preview_window.geometry("760x620")
+        preview_window.geometry("1080x720")
         preview_window.transient(self.winfo_toplevel())
 
         main_frame = ttk.Frame(preview_window)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        preview_frame = ttk.LabelFrame(main_frame, text="首次预测预览")
+        preview_frame = tk.LabelFrame(main_frame, text="多图原图 / 分割结果预览")
         preview_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
 
-        preview_label = ttk.Label(preview_frame)
-        preview_label.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        preview_canvas = tk.Canvas(preview_frame, highlightthickness=0)
+        preview_scrollbar = ttk.Scrollbar(preview_frame, orient=tk.VERTICAL, command=preview_canvas.yview)
+        preview_content = ttk.Frame(preview_canvas)
+        preview_window_ref = preview_canvas.create_window((0, 0), window=preview_content, anchor="nw")
+        preview_canvas.configure(yscrollcommand=preview_scrollbar.set)
+        preview_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        preview_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        controls_frame = ttk.LabelFrame(main_frame, text="标签颜色")
+        def _update_preview_scroll_region(_event=None):
+            preview_canvas.configure(scrollregion=preview_canvas.bbox("all"))
+
+        def _fit_preview_content(event):
+            preview_canvas.itemconfigure(preview_window_ref, width=event.width)
+
+        preview_content.bind("<Configure>", _update_preview_scroll_region)
+        preview_canvas.bind("<Configure>", _fit_preview_content)
+
+        controls_frame = tk.LabelFrame(main_frame, text="标签颜色")
         controls_frame.pack(side=tk.RIGHT, fill=tk.Y)
 
+        def get_prediction_classes(item):
+            classes = item.get("classes")
+            if classes is None:
+                mask_array = np.array(Image.open(item["mask_path"]))
+                classes = sorted(np.unique(mask_array).astype(int).tolist())
+                item["classes"] = classes
+            return set(classes)
+
+        target_classes = set(color_map.keys())
+        selected_predictions = []
+        covered_classes = set()
+        remaining_predictions = list(predictions)
+        while remaining_predictions and not target_classes.issubset(covered_classes):
+            best_item = max(
+                remaining_predictions,
+                key=lambda item: len(get_prediction_classes(item) - covered_classes)
+            )
+            selected_predictions.append(best_item)
+            covered_classes.update(get_prediction_classes(best_item))
+            remaining_predictions.remove(best_item)
+
+        if not selected_predictions:
+            selected_predictions = predictions[:1]
+        preview_rows = []
+
         def refresh_preview():
-            mask_array = np.array(Image.open(predictions[0]["mask_path"]))
-            image = SegmentationPredictor._colorize_mask(mask_array, color_map)
-            image.thumbnail((430, 430), Image.NEAREST)
-            preview_photo = ImageTk.PhotoImage(image)
-            preview_label.configure(image=preview_photo)
-            preview_label.image = preview_photo
+            preview_window.preview_images = []
+            for row in preview_rows:
+                original = Image.open(row["image_path"]).convert("RGB")
+                original.thumbnail((320, 240), Image.LANCZOS)
+                original_photo = ImageTk.PhotoImage(original)
+                row["original_label"].configure(image=original_photo)
+                preview_window.preview_images.append(original_photo)
+
+                mask_array = np.array(Image.open(row["mask_path"]))
+                result = SegmentationPredictor._colorize_mask(mask_array, color_map)
+                result.thumbnail((320, 240), Image.NEAREST)
+                result_photo = ImageTk.PhotoImage(result)
+                row["result_label"].configure(image=result_photo)
+                preview_window.preview_images.append(result_photo)
 
         def choose_color(class_id, button):
             initial_color = "#%02x%02x%02x" % color_map[class_id]
@@ -649,6 +699,37 @@ class SegmentationPredictTab(ttk.Frame):
                 color_map[class_id] = rgb
                 button.configure(text=f"类别{class_id}: #{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}")
                 refresh_preview()
+
+        coverage_text = f"当前预览 {len(selected_predictions)} 张，覆盖类别: " + ", ".join(
+            f"类别{class_id}" for class_id in sorted(covered_classes)
+        )
+        ttk.Label(preview_content, text=coverage_text, wraplength=680).grid(
+            row=0, column=0, columnspan=2, sticky=tk.W, padx=8, pady=(8, 4)
+        )
+        ttk.Label(preview_content, text="原图", font=("微软雅黑", 10, "bold")).grid(
+            row=1, column=0, padx=8, pady=(4, 2)
+        )
+        ttk.Label(preview_content, text="分割结果", font=("微软雅黑", 10, "bold")).grid(
+            row=1, column=1, padx=8, pady=(4, 2)
+        )
+
+        for idx, item in enumerate(selected_predictions):
+            display_row = idx * 2 + 2
+            filename = item.get("filename", os.path.basename(item.get("image_path", "")))
+            classes = ", ".join(f"{class_id}" for class_id in sorted(get_prediction_classes(item)))
+            ttk.Label(preview_content, text=f"{filename}    类别: {classes}", wraplength=680).grid(
+                row=display_row, column=0, columnspan=2, sticky=tk.W, padx=8, pady=(10, 2)
+            )
+            original_label = ttk.Label(preview_content, anchor=tk.CENTER)
+            original_label.grid(row=display_row + 1, column=0, padx=8, pady=(0, 8), sticky="n")
+            result_label = ttk.Label(preview_content, anchor=tk.CENTER)
+            result_label.grid(row=display_row + 1, column=1, padx=8, pady=(0, 8), sticky="n")
+            preview_rows.append({
+                "image_path": item.get("image_path"),
+                "mask_path": item["mask_path"],
+                "original_label": original_label,
+                "result_label": result_label,
+            })
 
         ttk.Label(controls_frame, text="默认使用当前标签映射；可为每类选择更醒目的颜色。", wraplength=230).pack(
             fill=tk.X, padx=8, pady=(8, 4)

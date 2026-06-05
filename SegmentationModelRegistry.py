@@ -1,10 +1,13 @@
 import inspect
 import io
 import logging
+import os
 import sys
+from urllib.parse import urlparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from config import config
 from torchvision.models import mobilenet_v3_large, resnet50, resnet101
 from torchvision.models.segmentation import (
     deeplabv3_mobilenet_v3_large,
@@ -36,6 +39,67 @@ def _ensure_console_streams():
         sys.stdout = _NullConsole()
     if sys.stderr is None:
         sys.stderr = _NullConsole()
+
+
+def _offline_mode_enabled():
+    return bool(config.get("offline_mode", True))
+
+
+def _configure_offline_environment():
+    if not _offline_mode_enabled():
+        return
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+
+
+def _cached_pretrained_enabled():
+    return bool(config.get("use_cached_pretrained", True))
+
+
+def _torchvision_weight_cache_path(weights):
+    url = getattr(weights, "url", None)
+    if not url:
+        return None
+    filename = os.path.basename(urlparse(url).path)
+    if not filename:
+        return None
+    return os.path.join(torch.hub.get_dir(), "checkpoints", filename)
+
+
+def _allow_torchvision_weights(weights, label):
+    _configure_offline_environment()
+    if weights is None:
+        return None
+    if not _offline_mode_enabled():
+        return weights
+    if not _cached_pretrained_enabled():
+        logging.info(f"{label} 离线模式已启用，跳过预训练权重")
+        return None
+
+    cache_path = _torchvision_weight_cache_path(weights)
+    if cache_path and os.path.exists(cache_path):
+        logging.info(f"{label} 使用本地缓存预训练权重: {cache_path}")
+        return weights
+
+    logging.warning(f"{label} 离线模式下未找到本地预训练缓存，改用随机初始化")
+    return None
+
+
+def _build_with_pretrained_fallback(builder, label, random_kwargs=None, **kwargs):
+    random_kwargs = random_kwargs or {}
+    try:
+        return builder(**kwargs)
+    except Exception as e:
+        if kwargs.get("weights") is None:
+            raise
+        logging.warning(f"{label} 预训练权重加载失败，改用随机初始化: {e}")
+        fallback_kwargs = dict(kwargs)
+        fallback_kwargs.update(random_kwargs)
+        fallback_kwargs["weights"] = None
+        if "weights_backbone" in fallback_kwargs:
+            fallback_kwargs["weights_backbone"] = None
+        return builder(**fallback_kwargs)
 
 
 ARCH_TO_BACKBONES = {
@@ -173,21 +237,21 @@ def _resolve_seg_weights(model_name, use_pretrained):
     try:
         if model_name == "DeepLabV3 (ResNet50)":
             from torchvision.models.segmentation.deeplabv3 import DeepLabV3_ResNet50_Weights
-            return DeepLabV3_ResNet50_Weights.DEFAULT
+            return _allow_torchvision_weights(DeepLabV3_ResNet50_Weights.DEFAULT, model_name)
         if model_name == "DeepLabV3 (ResNet101)":
             from torchvision.models.segmentation.deeplabv3 import DeepLabV3_ResNet101_Weights
-            return DeepLabV3_ResNet101_Weights.DEFAULT
+            return _allow_torchvision_weights(DeepLabV3_ResNet101_Weights.DEFAULT, model_name)
         if model_name == "DeepLabV3 (MobileNetV3-Large)":
             from torchvision.models.segmentation.deeplabv3 import DeepLabV3_MobileNet_V3_Large_Weights
-            return DeepLabV3_MobileNet_V3_Large_Weights.DEFAULT
+            return _allow_torchvision_weights(DeepLabV3_MobileNet_V3_Large_Weights.DEFAULT, model_name)
         if model_name == "FCN (ResNet50)":
             from torchvision.models.segmentation.fcn import FCN_ResNet50_Weights
-            return FCN_ResNet50_Weights.DEFAULT
+            return _allow_torchvision_weights(FCN_ResNet50_Weights.DEFAULT, model_name)
         if model_name == "FCN (ResNet101)":
             from torchvision.models.segmentation.fcn import FCN_ResNet101_Weights
-            return FCN_ResNet101_Weights.DEFAULT
+            return _allow_torchvision_weights(FCN_ResNet101_Weights.DEFAULT, model_name)
     except ImportError:
-        return True
+        return None
     return None
 
 
@@ -197,15 +261,15 @@ def _resolve_backbone_weights(backbone_name, use_pretrained):
     try:
         if backbone_name == "ResNet50":
             from torchvision.models import ResNet50_Weights
-            return ResNet50_Weights.DEFAULT
+            return _allow_torchvision_weights(ResNet50_Weights.DEFAULT, backbone_name)
         if backbone_name == "ResNet101":
             from torchvision.models import ResNet101_Weights
-            return ResNet101_Weights.DEFAULT
+            return _allow_torchvision_weights(ResNet101_Weights.DEFAULT, backbone_name)
         if backbone_name == "MobileNetV3-Large":
             from torchvision.models import MobileNet_V3_Large_Weights
-            return MobileNet_V3_Large_Weights.DEFAULT
+            return _allow_torchvision_weights(MobileNet_V3_Large_Weights.DEFAULT, backbone_name)
     except ImportError:
-        return True
+        return None
     return None
 
 
@@ -313,9 +377,21 @@ class ResNetBackbone(nn.Module):
         weights = _resolve_backbone_weights(backbone_name, use_pretrained)
         dilation_cfg = [False, True, True] if output_stride == 8 else [False, False, True]
         if backbone_name == "ResNet50":
-            model = resnet50(weights=weights, progress=False, replace_stride_with_dilation=dilation_cfg)
+            model = _build_with_pretrained_fallback(
+                resnet50,
+                backbone_name,
+                weights=weights,
+                progress=False,
+                replace_stride_with_dilation=dilation_cfg,
+            )
         elif backbone_name == "ResNet101":
-            model = resnet101(weights=weights, progress=False, replace_stride_with_dilation=dilation_cfg)
+            model = _build_with_pretrained_fallback(
+                resnet101,
+                backbone_name,
+                weights=weights,
+                progress=False,
+                replace_stride_with_dilation=dilation_cfg,
+            )
         else:
             raise ValueError(f"不支持的ResNet骨干: {backbone_name}")
         self.stem = nn.Sequential(model.conv1, model.bn1, model.relu, model.maxpool)
@@ -334,10 +410,13 @@ class ResNetBackbone(nn.Module):
 class MobileNetV3Backbone(nn.Module):
     def __init__(self, use_pretrained):
         super().__init__()
-        features = mobilenet_v3_large(
+        model = _build_with_pretrained_fallback(
+            mobilenet_v3_large,
+            "MobileNetV3-Large",
             weights=_resolve_backbone_weights("MobileNetV3-Large", use_pretrained),
             progress=False,
-        ).features
+        )
+        features = model.features
         stage_indices = [0] + [i for i, b in enumerate(features) if getattr(b, "_is_cn", False)] + [len(features) - 1]
         low_idx = stage_indices[-4]
         self.low_features = features[: low_idx + 1]
@@ -412,12 +491,26 @@ def build_pspnet_resnet50(num_classes, use_pretrained):
         import segmentation_models_pytorch as smp
     except ImportError:
         _missing_dependency_error("PSPNet-ResNet50", "segmentation_models_pytorch", "pip install segmentation-models-pytorch")
-    model = smp.PSPNet(
-        encoder_name="resnet50",
-        encoder_weights="imagenet" if use_pretrained else None,
-        in_channels=3,
-        classes=num_classes,
-    )
+    encoder_weights = "imagenet" if use_pretrained and not _offline_mode_enabled() else None
+    if use_pretrained and encoder_weights is None:
+        logging.warning("PSPNet 离线模式下跳过 encoder 预训练权重，改用随机初始化")
+    try:
+        model = smp.PSPNet(
+            encoder_name="resnet50",
+            encoder_weights=encoder_weights,
+            in_channels=3,
+            classes=num_classes,
+        )
+    except Exception as e:
+        if encoder_weights is None:
+            raise
+        logging.warning(f"PSPNet 预训练权重加载失败，改用随机初始化: {e}")
+        model = smp.PSPNet(
+            encoder_name="resnet50",
+            encoder_weights=None,
+            in_channels=3,
+            classes=num_classes,
+        )
     return TensorOutputWrapper(model)
 
 
@@ -471,6 +564,7 @@ def build_upernet_swin_t(num_classes, use_pretrained):
                 "openmmlab/upernet-swin-tiny",
                 num_labels=num_classes,
                 ignore_mismatched_sizes=True,
+                local_files_only=_offline_mode_enabled(),
             )
             return TensorOutputWrapper(model)
         except Exception as e:
@@ -560,6 +654,7 @@ class SFANet(nn.Module):
 
 def build_model(model_name, num_classes, use_pretrained=True, aux_loss=False, architecture_params=None):
     _ensure_console_streams()
+    _configure_offline_environment()
 
     if model_name not in MODEL_BUILDERS:
         raise ValueError(f"不支持的模型类型: {model_name}")
@@ -586,17 +681,21 @@ def build_model(model_name, num_classes, use_pretrained=True, aux_loss=False, ar
 
     weights = _resolve_seg_weights(model_name, use_pretrained)
     kwargs = {"weights": weights}
-    if "progress" in inspect.signature(builder_fn).parameters:
+    builder_signature = inspect.signature(builder_fn).parameters
+    if "progress" in builder_signature:
         kwargs["progress"] = False
+    if "weights_backbone" in builder_signature:
+        # Prevent torchvision from downloading backbone weights when full segmentation weights are unavailable.
+        kwargs["weights_backbone"] = None
     requested_aux_loss = arch_params.get("aux_loss", aux_loss)
-    if "aux_loss" in inspect.signature(builder_fn).parameters:
+    if "aux_loss" in builder_signature:
         # torchvision segmentation builders require aux_loss=True when pretrained segmentation weights are used.
         if weights is not None and requested_aux_loss is False:
             logging.info(f"{model_name} 使用预训练分割权重时，aux_loss已自动从False调整为True")
             kwargs["aux_loss"] = True
         else:
             kwargs["aux_loss"] = requested_aux_loss
-    base_model = builder_fn(**kwargs)
+    base_model = _build_with_pretrained_fallback(builder_fn, model_name, {"aux_loss": requested_aux_loss}, **kwargs)
     replace_classifier_head(base_model, family, cls_in_channels, num_classes)
     return base_model, family, cls_in_channels
 

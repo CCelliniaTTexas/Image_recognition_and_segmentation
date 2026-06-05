@@ -323,6 +323,24 @@ class SettingsTab(ttk.Frame):
         accum_spin.pack(side=tk.LEFT, padx=5)
         ttk.Label(accum_frame, text="(1=不累积, 4=等效batch×4)").pack(side=tk.LEFT)
 
+        offline_frame = tk.LabelFrame(parent, text="离线训练")
+        offline_frame.pack(fill=tk.X, padx=5, pady=5)
+        self.offline_mode_var = BooleanVar(value=config.get('offline_mode', True))
+        ttk.Checkbutton(
+            offline_frame,
+            text="启用离线模式（不联网下载预训练权重）",
+            variable=self.offline_mode_var,
+            command=lambda: config.set('offline_mode', self.offline_mode_var.get())
+        ).pack(anchor=tk.W, padx=5, pady=2)
+
+        self.cached_pretrained_var = BooleanVar(value=config.get('use_cached_pretrained', True))
+        ttk.Checkbutton(
+            offline_frame,
+            text="离线模式下优先使用本地缓存的预训练权重",
+            variable=self.cached_pretrained_var,
+            command=lambda: config.set('use_cached_pretrained', self.cached_pretrained_var.get())
+        ).pack(anchor=tk.W, padx=5, pady=2)
+
         parallel_frame = tk.LabelFrame(parent, text="并行处理")
         parallel_frame.pack(fill=tk.X, padx=5, pady=5)
         cpu_frame = ttk.Frame(parallel_frame)
@@ -331,9 +349,9 @@ class SettingsTab(ttk.Frame):
         worker_frame = ttk.Frame(parallel_frame)
         worker_frame.pack(fill=tk.X, padx=5, pady=2)
         ttk.Label(worker_frame, text="工作线程数:").pack(side=tk.LEFT)
-        self.num_workers_var = StringVar(value=config.get('num_workers',max(1, multiprocessing.cpu_count() - 1)))
+        self.num_workers_var = StringVar(value=config.get('num_workers', 0))
 
-        workers = ttk.Spinbox(worker_frame, from_=1,
+        workers = ttk.Spinbox(worker_frame, from_=0,
                               to=multiprocessing.cpu_count(),
                               textvariable=self.num_workers_var,
                               command=self.update_workers)

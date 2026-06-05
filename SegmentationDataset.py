@@ -11,7 +11,8 @@ SUPPORTED_IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
 
 
 class SegmentationDataset(Dataset):
-    def __init__(self, root_dir, phase='train', transform=None, img_size=256, enable_augmentation=False):
+    def __init__(self, root_dir, phase='train', transform=None, img_size=256, enable_augmentation=False,
+                 value_to_class=None):
         self.root_dir = root_dir
         self.phase = phase
         self.transform = transform
@@ -24,20 +25,32 @@ class SegmentationDataset(Dataset):
         self.images = [f for f in os.listdir(self.images_dir)
                        if f.lower().endswith(SUPPORTED_IMAGE_EXTENSIONS)]
 
-        self.value_to_class = self._build_class_mapping()
+        self.value_to_class = value_to_class or self.build_class_mapping(root_dir, phases=(phase,))
         self.num_classes = len(self.value_to_class)
         logging.info(f"[{phase}] 掩码像素值→类别映射: {self.value_to_class}  (共 {self.num_classes} 类)")
 
-    def _build_class_mapping(self):
-        """Scan masks to discover all unique pixel values and map them to 0..N-1."""
+    @classmethod
+    def build_class_mapping(cls, root_dir, phases=('train', 'valid')):
+        """Scan all masks in the selected phases and map discovered pixel values to 0..N-1."""
         unique_values = set()
-        scan_count = min(len(self.images), 50)
-        for img_name in self.images[:scan_count]:
-            name_without_ext = os.path.splitext(img_name)[0]
-            mask_path = os.path.join(self.masks_dir, f"{name_without_ext}_lab.png")
-            if os.path.exists(mask_path):
-                mask = np.array(Image.open(mask_path))
-                unique_values.update(mask.flatten().tolist())
+        for phase in phases:
+            images_dir = os.path.join(root_dir, phase, 'images')
+            masks_dir = os.path.join(root_dir, phase, 'masks')
+            if not os.path.isdir(images_dir) or not os.path.isdir(masks_dir):
+                continue
+
+            image_names = [
+                f for f in os.listdir(images_dir)
+                if f.lower().endswith(SUPPORTED_IMAGE_EXTENSIONS)
+            ]
+            for img_name in image_names:
+                name_without_ext = os.path.splitext(img_name)[0]
+                mask_path = os.path.join(masks_dir, f"{name_without_ext}_lab.png")
+                if os.path.exists(mask_path):
+                    mask = np.array(Image.open(mask_path))
+                    if mask.ndim == 3:
+                        mask = mask[:, :, 0]
+                    unique_values.update(int(v) for v in np.unique(mask).tolist())
 
         sorted_values = sorted(unique_values)
         return {v: i for i, v in enumerate(sorted_values)}
@@ -60,6 +73,8 @@ class SegmentationDataset(Dataset):
             image, mask = self._apply_train_augmentations(image, mask)
 
         mask_np = np.array(mask)
+        if mask_np.ndim == 3:
+            mask_np = mask_np[:, :, 0]
         remapped = np.zeros_like(mask_np)
         for pixel_val, class_idx in self.value_to_class.items():
             remapped[mask_np == pixel_val] = class_idx

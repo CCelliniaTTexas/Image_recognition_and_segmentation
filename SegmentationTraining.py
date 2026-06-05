@@ -12,6 +12,7 @@ import logging
 import queue
 import logging.handlers
 import multiprocessing
+import sys
 import numpy as np
 from openpyxl import Workbook
 from datetime import datetime
@@ -94,6 +95,13 @@ class SegmentationTrainingTab(ttk.Frame):
         self.parent = parent
         self.queue = queue.Queue()
         self.training_history = TrainingHistoryStore()
+        self._last_progress_enqueue_time = 0.0
+        self._last_plot_refresh_time = 0.0
+        self._last_label_refresh_time = 0.0
+        self._progress_enqueue_interval = 0.5
+        self._plot_refresh_interval = 2.0
+        self._label_refresh_interval = 0.2
+        self._max_progress_messages_per_tick = 20
         self.setup_ui()
         self.stop_training = False
         self.bind_all('<Control-t>', lambda e: self.start_training())
@@ -430,7 +438,7 @@ class SegmentationTrainingTab(ttk.Frame):
         all_epochs = self.train_data['batch_indices'] + self.val_data['batch_indices']
         if not all_epochs:
             for spec in self.plot_specs.values():
-                spec['canvas'].draw()
+                spec['canvas'].draw_idle()
             return
 
         def _ema(values, alpha=0.12):
@@ -466,7 +474,7 @@ class SegmentationTrainingTab(ttk.Frame):
                 else:
                     ax.set_ylim(0, min(max(max_value * 1.1, 0.01), 1.05))
 
-            spec['canvas'].draw()
+            spec['canvas'].draw_idle()
 
     def update_plots(self, epoch_progress, train_loss=None, train_miou=None, train_oa=None,
                      train_f1=None, train_recall=None, val_loss=None, val_miou=None,
@@ -475,6 +483,10 @@ class SegmentationTrainingTab(ttk.Frame):
 
         def _update():
             try:
+                now = time.perf_counter()
+                is_validation_update = val_loss is not None and val_miou is not None
+                should_refresh_plot = is_validation_update or (now - self._last_plot_refresh_time >= self._plot_refresh_interval)
+
                 current_theme = self.winfo_toplevel().style.theme_use()
                 is_dark_theme = current_theme == 'darkly'
                 text_color = 'white' if is_dark_theme else 'black'
@@ -495,13 +507,15 @@ class SegmentationTrainingTab(ttk.Frame):
                     self.val_data['f1'].append(val_f1 if val_f1 is not None else 0)
                     self.val_data['recall'].append(val_recall if val_recall is not None else 0)
 
-                for spec in self.plot_specs.values():
-                    ax = spec['ax']
-                    ax.set_title(ax.get_title(), color=text_color)
-                    ax.set_xlabel(ax.get_xlabel(), color=text_color)
-                    ax.set_ylabel(ax.get_ylabel(), color=text_color)
-                    ax.tick_params(colors=text_color)
-                self._refresh_plot_data()
+                if should_refresh_plot:
+                    for spec in self.plot_specs.values():
+                        ax = spec['ax']
+                        ax.set_title(ax.get_title(), color=text_color)
+                        ax.set_xlabel(ax.get_xlabel(), color=text_color)
+                        ax.set_ylabel(ax.get_ylabel(), color=text_color)
+                        ax.tick_params(colors=text_color)
+                    self._refresh_plot_data()
+                    self._last_plot_refresh_time = now
 
             except Exception as e:
                 logging.error(f"更新图表失败: {str(e)}")
@@ -937,11 +951,17 @@ class SegmentationTrainingTab(ttk.Frame):
             ])
 
             logging.info(f"训练图像尺寸: {img_size}x{img_size}")
+            class_mapping = SegmentationDataset.build_class_mapping(dataset_path, phases=('train', 'valid'))
+            if not class_mapping:
+                raise ValueError("未能从训练集/验证集掩码中检测到类别，请检查 masks 目录和 *_lab.png 文件")
+            logging.info(f"数据集统一掩码像素值→类别映射: {class_mapping}  (共 {len(class_mapping)} 类)")
             train_dataset = SegmentationDataset(
-                dataset_path, 'train', transform, img_size=img_size, enable_augmentation=strong_augment
+                dataset_path, 'train', transform, img_size=img_size, enable_augmentation=strong_augment,
+                value_to_class=class_mapping
             )
             valid_dataset = SegmentationDataset(
-                dataset_path, 'valid', transform, img_size=img_size, enable_augmentation=False
+                dataset_path, 'valid', transform, img_size=img_size, enable_augmentation=False,
+                value_to_class=class_mapping
             )
 
             actual_classes = train_dataset.num_classes
@@ -989,7 +1009,13 @@ class SegmentationTrainingTab(ttk.Frame):
             loss_smoothing_alpha = float(config.get('loss_smoothing_alpha', 0.12))
             loss_smoothing_alpha = min(max(loss_smoothing_alpha, 0.0), 1.0)
 
-            num_workers = config.get('num_workers', max(1, multiprocessing.cpu_count() - 1))
+            configured_workers = int(config.get('num_workers', 0))
+            if sys.platform.startswith('win'):
+                # Tkinter + Windows multiprocessing DataLoader often causes long stalls or a frozen GUI.
+                num_workers = 0
+            else:
+                num_workers = max(0, configured_workers)
+            logging.info(f"DataLoader工作进程数: {num_workers}")
             if history_run_id:
                 self.training_history.update_metadata(history_run_id, {
                     "runtime": {
@@ -1436,11 +1462,21 @@ class SegmentationTrainingTab(ttk.Frame):
             )
             logging.info(f"使用模型: {model_name}, 预训练: {use_pretrained}, 注意力机制: {attention_label}")
             logging.info(f"架构参数: {arch_params}")
+            self._last_progress_enqueue_time = 0.0
+            self._last_plot_refresh_time = 0.0
+            self._last_label_refresh_time = 0.0
 
             def update_progress(epoch, batch, total_batches, train_loss=None, train_miou=None, train_oa=None,
                                 train_f1=None, train_recall=None, val_loss=None, val_miou=None,
                                 val_oa=None, val_f1=None, val_recall=None):
                 metric_type = 'val' if val_loss is not None else 'train'
+                now = time.perf_counter()
+                is_epoch_end = batch >= total_batches
+                if metric_type == 'train' and not is_epoch_end:
+                    if now - self._last_progress_enqueue_time < self._progress_enqueue_interval:
+                        return
+                self._last_progress_enqueue_time = now
+
                 payload = {
                     'epoch': epoch,
                     'batch': batch,
@@ -1457,11 +1493,9 @@ class SegmentationTrainingTab(ttk.Frame):
                     'val_f1': val_f1,
                     'val_recall': val_recall,
                 }
+                if metric_type == 'train' and self.queue.qsize() > self._max_progress_messages_per_tick * 2:
+                    return
                 self.queue.put(payload)
-
-            self.progress_bar = ttk.Progressbar(
-                info_frame, variable=self.progress_var, maximum=100)
-            self.progress_bar.pack(fill=tk.X, pady=5)
 
             # 创建训练线程
             self.stop_training = False
@@ -1472,6 +1506,7 @@ class SegmentationTrainingTab(ttk.Frame):
                       weight_decay, decoder_dropout, strong_augment, img_size, arch_params, metrics_output_path,
                       history_run_id)
             )
+            self.training_thread.daemon = True
             self.training_thread.start()
             # 训练线程启动后再轮询队列，避免首次检查时线程尚未创建导致轮询提前结束
             self.after(100, self.check_progress)
@@ -1485,10 +1520,14 @@ class SegmentationTrainingTab(ttk.Frame):
 
     def check_progress(self):
         """检查进度队列"""
+        processed_messages = 0
         try:
             while True:
+                if processed_messages >= self._max_progress_messages_per_tick:
+                    break
                 # 非阻塞方式获取消息
                 msg = self.queue.get_nowait()
+                processed_messages += 1
                 if isinstance(msg, dict):
                     epoch = msg['epoch']
                     batch = msg['batch']
@@ -1518,22 +1557,30 @@ class SegmentationTrainingTab(ttk.Frame):
                     val_recall = None
 
                 try:
+                    now = time.perf_counter()
+                    should_update_labels = (
+                        metric_type == 'val'
+                        or now - self._last_label_refresh_time >= self._label_refresh_interval
+                        or batch >= total_batches
+                    )
                     if hasattr(self, 'progress_window') and self.progress_window.winfo_exists():
-                        self.epoch_label.config(text=f"当前轮次: {epoch}/{self.epochs.get()}")
-                        self.batch_label.config(text=f"批次进度: {batch}/{total_batches}")
+                        if should_update_labels:
+                            self.epoch_label.config(text=f"当前轮次: {epoch}/{self.epochs.get()}")
+                            self.batch_label.config(text=f"批次进度: {batch}/{total_batches}")
 
-                        if metric_type == 'train' and train_loss is not None:
-                            self.loss_label.config(text=f"当前损失: {train_loss:.4f}")
-                            self.miou_label.config(text=f"当前mIoU: {train_miou:.4f}")
-                            self.oa_label.config(text=f"当前OA: {train_oa:.2f}%")
-                            self.f1_label.config(text=f"当前F1-score: {(train_f1 or 0):.4f}")
-                            self.recall_label.config(text=f"当前召回率: {(train_recall or 0):.4f}")
-                        elif metric_type == 'val' and val_loss is not None:
-                            self.loss_label.config(text=f"验证损失: {val_loss:.4f}")
-                            self.miou_label.config(text=f"验证mIoU: {val_miou:.4f}")
-                            self.oa_label.config(text=f"验证OA: {val_oa:.2f}%")
-                            self.f1_label.config(text=f"验证F1-score: {(val_f1 or 0):.4f}")
-                            self.recall_label.config(text=f"验证召回率: {(val_recall or 0):.4f}")
+                            if metric_type == 'train' and train_loss is not None:
+                                self.loss_label.config(text=f"当前损失: {train_loss:.4f}")
+                                self.miou_label.config(text=f"当前mIoU: {train_miou:.4f}")
+                                self.oa_label.config(text=f"当前OA: {train_oa:.2f}%")
+                                self.f1_label.config(text=f"当前F1-score: {(train_f1 or 0):.4f}")
+                                self.recall_label.config(text=f"当前召回率: {(train_recall or 0):.4f}")
+                            elif metric_type == 'val' and val_loss is not None:
+                                self.loss_label.config(text=f"验证损失: {val_loss:.4f}")
+                                self.miou_label.config(text=f"验证mIoU: {val_miou:.4f}")
+                                self.oa_label.config(text=f"验证OA: {val_oa:.2f}%")
+                                self.f1_label.config(text=f"验证F1-score: {(val_f1 or 0):.4f}")
+                                self.recall_label.config(text=f"验证召回率: {(val_recall or 0):.4f}")
+                            self._last_label_refresh_time = now
 
                         progress = (epoch - 1 + batch / total_batches) / int(self.epochs.get()) * 100
                         self.progress_var.set(progress)
